@@ -105,7 +105,8 @@ def test_run_ltfs_rsync_succeeds_when_ltfs_daemonizes():
         ltfs_mock.stderr = io.StringIO("")
 
         rsync_mock = MagicMock()
-        rsync_mock.stderr = iter([])  # no progress lines
+        rsync_mock.stderr = io.StringIO("")  # no progress lines; read() returns ""
+        rsync_mock.poll.return_value = 0  # exited, so read loop breaks after first read
         rsync_mock.returncode = 0
         rsync_mock.wait.return_value = None
 
@@ -115,14 +116,15 @@ def test_run_ltfs_rsync_succeeds_when_ltfs_daemonizes():
                 side_effect=lambda c: "/usr/bin/ltfs" if c in ("ltfs", "rsync") else None,
             ):
                 with patch("tape_drive_controller.tape.ltfs.os.path.ismount", return_value=True):
-                    with patch(
-                        "tape_drive_controller.tape.ltfs.subprocess.Popen",
-                        side_effect=[ltfs_mock, rsync_mock],
-                    ):
+                    with patch("tape_drive_controller.tape.ltfs.pty", None):  # use pipe so stderr.read() returns ""
                         with patch(
-                            "tape_drive_controller.tape.ltfs.subprocess.run",
-                            return_value=MagicMock(returncode=0),
+                            "tape_drive_controller.tape.ltfs.subprocess.Popen",
+                            side_effect=[ltfs_mock, rsync_mock],
                         ):
-                            run_ltfs_rsync("/dev/nst0", paths)
+                            with patch(
+                                "tape_drive_controller.tape.ltfs.subprocess.run",
+                                return_value=MagicMock(returncode=0),
+                            ):
+                                run_ltfs_rsync("/dev/nst0", paths)
 
         rsync_mock.wait.assert_called_once()

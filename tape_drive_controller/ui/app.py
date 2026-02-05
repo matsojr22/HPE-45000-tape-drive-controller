@@ -1,4 +1,5 @@
 """GTK 3 application: main window with device selector, directory list, backup controls, and log."""
+import subprocess
 import sys
 import threading
 from typing import Optional
@@ -18,12 +19,16 @@ from ..tape.backup import (
     TapeBackupError,
 )
 from ..tape.capacity import query_remaining_capacity_bytes
+from ..tape.diagnostics import run_tape_diagnostics
 from ..tape.ltfs import (
     format_ltfs,
     is_ltfs_available,
     is_ltfs_mount_available,
     tape_has_ltfs,
     run_ltfs_rsync,
+    mount_ltfs_only,
+    unmount_ltfs,
+    unmount_leftover_ltfs_mounts,
 )
 
 
@@ -74,7 +79,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self._cancel_browse_requested = False
         self._ltfs_rsync_thread = None
         self._cancel_ltfs_rsync_requested = False
+        self._ltfs_rsync_process_holder: list = []  # [ltfs_proc, rsync_proc] when backup; [ltfs_proc] when standalone mount
+        self._ltfs_mount_point_holder: list = [None]  # current LTFS mount path when mounted (backup or standalone)
+        self._ltfs_standalone_mount = False  # True when mount was created by "Mount LTFS" (so Unmount is offered)
         self._ltfs_mode = False
+        self._ltfs_mount_thread = None  # thread for standalone Mount LTFS
         self._ltfs_startup_check_pending = True
         self._restore_destination: Optional[str] = None
         self._progress_is_restore = False
@@ -98,6 +107,18 @@ class MainWindow(Gtk.ApplicationWindow):
         refresh_btn = Gtk.Button(label="Refresh")
         refresh_btn.connect("clicked", self._on_refresh_devices)
         dev_row.pack_start(refresh_btn, False, False, 0)
+        self._tape_diagnostics_btn = Gtk.Button(label="Tape diagnostics")
+        self._tape_diagnostics_btn.set_tooltip_text(
+            "Run fuser, lsof, mount, and dmesg for the selected tape device and log output (e.g. when device is busy)."
+        )
+        self._tape_diagnostics_btn.connect("clicked", self._on_tape_diagnostics)
+        dev_row.pack_start(self._tape_diagnostics_btn, False, False, 0)
+        self._check_ltfs_btn = Gtk.Button(label="Check for LTFS")
+        self._check_ltfs_btn.set_tooltip_text(
+            "Check whether the selected tape has an LTFS partition and offer to switch to LTFS mode."
+        )
+        self._check_ltfs_btn.connect("clicked", self._on_check_ltfs)
+        dev_row.pack_start(self._check_ltfs_btn, False, False, 0)
         box.pack_start(dev_row, False, False, 0)
         self._refresh_devices()
 
@@ -204,6 +225,21 @@ class MainWindow(Gtk.ApplicationWindow):
             "Leave LTFS mode and re-enable tape preparation and raw backup."
         )
         self._exit_ltfs_mode_btn.connect("clicked", self._on_exit_ltfs_mode)
+        self._mount_ltfs_btn = Gtk.Button(label="Mount LTFS")
+        self._mount_ltfs_btn.set_tooltip_text(
+            "Mount the selected tape as LTFS so you can browse or copy files. No backup is run."
+        )
+        self._mount_ltfs_btn.connect("clicked", self._on_mount_ltfs)
+        self._unmount_ltfs_btn = Gtk.Button(label="Unmount LTFS")
+        self._unmount_ltfs_btn.set_tooltip_text(
+            "Unmount the current LTFS mount (only when you mounted via Mount LTFS, not during backup)."
+        )
+        self._unmount_ltfs_btn.connect("clicked", self._on_unmount_ltfs)
+        self._browse_ltfs_btn = Gtk.Button(label="Browse mount")
+        self._browse_ltfs_btn.set_tooltip_text(
+            "Open the file manager at the current LTFS mount point."
+        )
+        self._browse_ltfs_btn.connect("clicked", self._on_browse_ltfs)
         btn_row.pack_start(self._start_btn, False, False, 0)
         btn_row.pack_start(self._cancel_btn, False, False, 0)
         btn_row.pack_start(self._status_btn, False, False, 0)
@@ -212,6 +248,9 @@ class MainWindow(Gtk.ApplicationWindow):
         box.pack_start(btn_row, False, False, 0)
         ltfs_mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         ltfs_mode_row.pack_start(Gtk.Label(label="LTFS mode:", xalign=0), False, False, 0)
+        ltfs_mode_row.pack_start(self._mount_ltfs_btn, False, False, 0)
+        ltfs_mode_row.pack_start(self._unmount_ltfs_btn, False, False, 0)
+        ltfs_mode_row.pack_start(self._browse_ltfs_btn, False, False, 0)
         ltfs_mode_row.pack_start(self._exit_ltfs_mode_btn, False, False, 0)
         self._ltfs_mode_row = ltfs_mode_row
         box.pack_start(ltfs_mode_row, False, False, 0)
@@ -252,6 +291,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._device_combo.connect("changed", self._on_device_changed)
         self._dir_store.connect("row-deleted", lambda *a: self._update_start_sensitivity())
         self._dir_store.connect("row-inserted", lambda *a: self._update_start_sensitivity())
+        self.connect("destroy", self._on_destroy)
         GLib.idle_add(self._maybe_check_ltfs_after_show)
 
         self._main_box = box
@@ -301,6 +341,35 @@ class MainWindow(Gtk.ApplicationWindow):
         self._refresh_devices()
         self._update_start_sensitivity()
 
+    def _on_tape_diagnostics(self, _btn):
+        device = self._get_selected_device_path()
+        if not device:
+            self._log("Select a tape device first.")
+            return
+        self._log("=== Tape diagnostics (selected device: %s) ===" % device)
+        def run_diag():
+            run_tape_diagnostics(device, lambda line: GLib.idle_add(self._log, line))
+        threading.Thread(target=run_diag, daemon=True).start()
+
+    def _on_check_ltfs(self, _btn):
+        device = self._get_selected_device_path()
+        if not device:
+            self._log("Select a tape device first.")
+            return
+        self._log("Checking for LTFS partition on %s…" % device)
+
+        def completion(has_ltfs):
+            if not has_ltfs:
+                self._log("No LTFS partition found on %s." % device)
+            self._on_ltfs_check_done(has_ltfs)
+
+        def run():
+            unmount_leftover_ltfs_mounts(on_log=lambda line: GLib.idle_add(self._log, line))
+            has_ltfs = tape_has_ltfs(device)
+            GLib.idle_add(completion, has_ltfs)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _on_device_changed(self, combo):
         self._update_start_sensitivity()
         self._run_ltfs_check_if_needed()
@@ -312,6 +381,40 @@ class MainWindow(Gtk.ApplicationWindow):
         self._main_box.set_sensitive(True)
         self._update_start_sensitivity()
 
+    def _on_destroy(self, _widget) -> None:
+        """On window close: clean unmount LTFS if active, terminate child processes, then quit."""
+        self._cancel_ltfs_rsync_requested = True
+        mount_point = self._ltfs_mount_point_holder[0] if self._ltfs_mount_point_holder else None
+        if mount_point:
+            try:
+                subprocess.run(
+                    ["fusermount", "-u", mount_point],
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                try:
+                    subprocess.run(
+                        ["umount", mount_point],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except subprocess.TimeoutExpired:
+                    pass
+        # Terminate in reverse order: rsync first, then ltfs (stops writes before killing mount)
+        for proc in reversed(self._ltfs_rsync_process_holder):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+            except (OSError, ValueError):
+                pass
+        if self._ltfs_rsync_thread is not None and self._ltfs_rsync_thread.is_alive():
+            self._ltfs_rsync_thread.join(timeout=3.0)
+        app = self.get_application()
+        if app is not None:
+            app.quit()
+
     def _maybe_check_ltfs_after_show(self):
         """Called once after window is shown to detect LTFS tape on initial device."""
         device = self._get_selected_device_path()
@@ -322,12 +425,14 @@ class MainWindow(Gtk.ApplicationWindow):
             or self._format_ltfs_thread is not None
             or self._browse_thread is not None
             or self._ltfs_rsync_thread is not None
+            or self._ltfs_mount_thread is not None
         )
         if not device or self._ltfs_mode or any_busy:
             self._ltfs_startup_check_pending = False
             self._apply_ready_after_ltfs_check()
             return False
-        self._run_ltfs_check_if_needed()
+        # Defer so the loading overlay is visible for at least one frame before the check runs
+        GLib.idle_add(self._run_ltfs_check_if_needed)
         return False
 
     def _run_ltfs_check_if_needed(self):
@@ -342,10 +447,12 @@ class MainWindow(Gtk.ApplicationWindow):
             or self._format_ltfs_thread is not None
             or self._browse_thread is not None
             or self._ltfs_rsync_thread is not None
+            or self._ltfs_mount_thread is not None
         ):
             return
 
         def check():
+            unmount_leftover_ltfs_mounts(on_log=lambda line: GLib.idle_add(self._log, line))
             has_ltfs = tape_has_ltfs(device)
             GLib.idle_add(self._on_ltfs_check_done, has_ltfs)
 
@@ -418,7 +525,9 @@ class MainWindow(Gtk.ApplicationWindow):
         format_busy = self._format_ltfs_thread is not None
         browse_busy = self._browse_thread is not None
         ltfs_rsync_busy = self._ltfs_rsync_thread is not None
-        any_busy = backup_busy or restore_busy or erase_busy or format_busy or browse_busy or ltfs_rsync_busy
+        ltfs_mount_busy = self._ltfs_mount_thread is not None
+        any_busy = backup_busy or restore_busy or erase_busy or format_busy or browse_busy or ltfs_rsync_busy or ltfs_mount_busy
+        mount_point = self._ltfs_mount_point_holder[0] if self._ltfs_mount_point_holder else None
         if self._ltfs_mode:
             self._ltfs_mode_row.show()
             self._start_btn.set_sensitive(False)
@@ -430,7 +539,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self._ltfs_rsync_btn.set_sensitive(
                 not any_busy and bool(device and len(self._dir_store) > 0) and is_ltfs_mount_available()
             )
+            self._mount_ltfs_btn.set_sensitive(
+                not any_busy and bool(device) and not mount_point and is_ltfs_mount_available()
+            )
+            self._unmount_ltfs_btn.set_sensitive(
+                not any_busy and self._ltfs_standalone_mount and bool(mount_point)
+            )
+            self._browse_ltfs_btn.set_sensitive(bool(mount_point))
             self._status_btn.set_sensitive(not any_busy)
+            self._tape_diagnostics_btn.set_sensitive(not any_busy and bool(device))
+            self._check_ltfs_btn.set_sensitive(not any_busy and bool(device))
             self._exit_ltfs_mode_btn.set_sensitive(not any_busy)
             self._start_restore_btn.set_sensitive(False)
             self._cancel_btn.set_sensitive(any_busy)
@@ -449,6 +567,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self._rewind_btn.set_sensitive(not any_busy and bool(device))
             self._erase_btn.set_sensitive(not any_busy and bool(device))
             self._format_ltfs_btn.set_sensitive(not any_busy and bool(device))
+            self._tape_diagnostics_btn.set_sensitive(not any_busy and bool(device))
+            self._check_ltfs_btn.set_sensitive(not any_busy and bool(device))
             self._ltfs_rsync_btn.set_sensitive(
                 not any_busy and bool(device and len(self._dir_store) > 0) and is_ltfs_mount_available()
             )
@@ -705,11 +825,14 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _run_format_ltfs(self, device: str) -> None:
         try:
+            unmount_leftover_ltfs_mounts(on_log=lambda line: GLib.idle_add(self._log, line))
             format_ltfs(
                 device,
                 on_log=lambda line: GLib.idle_add(self._log, line),
                 force=True,
             )
+            GLib.idle_add(self._log, "Rewinding tape…")
+            rewind(device)
             GLib.idle_add(self._format_ltfs_finished, None)
         except Exception as e:
             GLib.idle_add(self._format_ltfs_finished, e)
@@ -719,6 +842,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self._update_start_sensitivity()
         if error:
             self._log("Format for LTFS failed: %s" % error)
+            device = self._get_selected_device_path()
+            if device:
+                self._log("Running tape diagnostics…")
+                def run_diag():
+                    run_tape_diagnostics(
+                        device,
+                        lambda line: GLib.idle_add(self._log, line),
+                    )
+                threading.Thread(target=run_diag, daemon=True).start()
         else:
             self._log("Format for LTFS completed.")
         self._log("=== Format for LTFS ended ===\n")
@@ -735,6 +867,14 @@ class MainWindow(Gtk.ApplicationWindow):
         if not is_ltfs_mount_available():
             self._log("LTFS (ltfs) and rsync are required for Backup to LTFS. Install LTFS and rsync.")
             return
+        # Clear any standalone mount so backup owns the tape
+        if self._ltfs_standalone_mount and self._ltfs_mount_point_holder and self._ltfs_mount_point_holder[0]:
+            mp = self._ltfs_mount_point_holder[0]
+            proc = self._ltfs_rsync_process_holder[0] if self._ltfs_rsync_process_holder else None
+            unmount_ltfs(mp, proc, on_log=lambda line: GLib.idle_add(self._log, line))
+            self._ltfs_mount_point_holder[0] = None
+            self._ltfs_standalone_mount = False
+            self._ltfs_rsync_process_holder.clear()
         self._cancel_ltfs_rsync_requested = False
         self._progress_is_restore = False
         self._update_start_sensitivity()
@@ -746,6 +886,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self._log("  %s" % p)
 
         def run():
+            self._ltfs_rsync_process_holder.clear()
             try:
                 run_ltfs_rsync(
                     device,
@@ -756,6 +897,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     ),
                     on_log=lambda line: GLib.idle_add(self._log, line),
                     cancel_check=lambda: self._cancel_ltfs_rsync_requested,
+                    process_holder=self._ltfs_rsync_process_holder,
+                    mount_point_holder=self._ltfs_mount_point_holder,
                 )
                 GLib.idle_add(self._ltfs_rsync_finished, None)
             except Exception as e:
@@ -779,6 +922,84 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _on_exit_ltfs_mode(self, _btn):
         self._ltfs_mode = False
+        self._update_start_sensitivity()
+
+    def _on_browse_ltfs(self, _btn):
+        mount_point = self._ltfs_mount_point_holder[0] if self._ltfs_mount_point_holder else None
+        if not mount_point:
+            self._log("No LTFS mount. Mount the tape first (Mount LTFS or run Backup to LTFS).")
+            return
+        try:
+            subprocess.Popen(
+                ["xdg-open", mount_point],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            try:
+                subprocess.Popen(
+                    ["gio", "open", mount_point],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                self._log("Could not open file manager (xdg-open and gio not found).")
+
+    def _on_mount_ltfs(self, _btn):
+        device = self._get_selected_device_path()
+        if not device:
+            self._log("Select a tape device first.")
+            return
+        if not is_ltfs_mount_available():
+            self._log("LTFS (ltfs) is required. Install LTFS to mount the tape.")
+            return
+        self._log("=== Mount LTFS started ===")
+        self._log("Device: %s" % device)
+
+        def run():
+            try:
+                mount_ltfs_only(
+                    device,
+                    on_log=lambda line: GLib.idle_add(self._log, line),
+                    mount_point_holder=self._ltfs_mount_point_holder,
+                    process_holder=self._ltfs_rsync_process_holder,
+                )
+                GLib.idle_add(self._ltfs_mount_finished, None)
+            except Exception as e:
+                GLib.idle_add(self._ltfs_mount_finished, e)
+
+        self._ltfs_mount_thread = threading.Thread(target=run, daemon=True)
+        self._ltfs_mount_thread.start()
+        self._update_start_sensitivity()
+
+    def _ltfs_mount_finished(self, error) -> None:
+        self._ltfs_mount_thread = None
+        self._update_start_sensitivity()
+        if error:
+            self._log("Mount LTFS failed: %s" % error)
+        else:
+            self._ltfs_standalone_mount = True
+            self._log("LTFS mounted at %s" % (self._ltfs_mount_point_holder[0] if self._ltfs_mount_point_holder else ""))
+            self._update_start_sensitivity()
+        self._log("=== Mount LTFS ended ===\n")
+
+    def _on_unmount_ltfs(self, _btn):
+        mount_point = self._ltfs_mount_point_holder[0] if self._ltfs_mount_point_holder else None
+        if not mount_point:
+            return
+        ltfs_proc = self._ltfs_rsync_process_holder[0] if self._ltfs_rsync_process_holder else None
+        unmount_ltfs(
+            mount_point,
+            ltfs_proc,
+            on_log=lambda line: GLib.idle_add(self._log, line),
+        )
+        self._ltfs_mount_point_holder[0] = None
+        self._ltfs_standalone_mount = False
+        if self._ltfs_rsync_process_holder and self._ltfs_rsync_process_holder[0] is ltfs_proc:
+            self._ltfs_rsync_process_holder.pop(0)
+        self._log("LTFS unmounted.")
         self._update_start_sensitivity()
 
     def _on_restore_browse(self, _btn):
@@ -817,13 +1038,14 @@ class MainWindow(Gtk.ApplicationWindow):
 
         cap_gb = self._tape_capacity_spin.get_value_as_int()
         max_tape_bytes = int(cap_gb * (1024 ** 3)) if cap_gb > 0 else None
+        skip_rewind = self._append_to_tape_cb.get_active()
 
-        def run():
+        def start_backup_thread():
             try:
                 run_backup(
                     device,
                     paths,
-                    skip_rewind=self._append_to_tape_cb.get_active(),
+                    skip_rewind=skip_rewind,
                     max_tape_bytes=max_tape_bytes,
                     on_progress=lambda m: GLib.idle_add(self._set_progress, m),
                     on_progress_update=lambda b, t, e: GLib.idle_add(
@@ -836,8 +1058,39 @@ class MainWindow(Gtk.ApplicationWindow):
             except Exception as e:
                 GLib.idle_add(self._backup_finished, e)
 
-        self._backup_thread = threading.Thread(target=run, daemon=True)
-        self._backup_thread.start()
+        def continuation(has_ltfs):
+            if has_ltfs:
+                dialog = Gtk.MessageDialog(
+                    transient_for=self,
+                    modal=True,
+                    message_type=Gtk.MessageType.WARNING,
+                    buttons=Gtk.ButtonsType.NONE,
+                    text="Tape has LTFS partition",
+                )
+                dialog.format_secondary_text(
+                    "This tape appears to be LTFS-formatted. A tar backup will overwrite and "
+                    "destroy the LTFS data. Use LTFS mode and 'Backup to LTFS (rsync)' to write "
+                    "to this tape. Continue with tar backup anyway?"
+                )
+                dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+                dialog.add_button("Continue anyway", Gtk.ResponseType.YES)
+                response = dialog.run()
+                dialog.destroy()
+                if response != Gtk.ResponseType.YES:
+                    self._log("Backup cancelled to protect LTFS tape.")
+                    self._update_start_sensitivity()
+                    return
+            self._backup_thread = threading.Thread(target=start_backup_thread, daemon=True)
+            self._backup_thread.start()
+            self._update_start_sensitivity()
+
+        def pre_check():
+            self._log("Checking for LTFS partition before tar backup…")
+            unmount_leftover_ltfs_mounts(on_log=lambda line: GLib.idle_add(self._log, line))
+            has_ltfs = tape_has_ltfs(device)
+            GLib.idle_add(continuation, has_ltfs)
+
+        threading.Thread(target=pre_check, daemon=True).start()
         self._update_start_sensitivity()
 
     def _backup_finished(self, error):
